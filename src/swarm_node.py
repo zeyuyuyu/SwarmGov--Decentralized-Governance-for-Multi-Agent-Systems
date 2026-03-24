@@ -1,87 +1,105 @@
-import time
+import asyncio
 from dataclasses import dataclass
-from typing import Dict, List, Optional
-import hashlib
+from typing import List, Dict, Callable
+from enum import Enum
+import time
+
+class VoteType(Enum):
+    YES = 1
+    NO = 0
+    ABSTAIN = -1
 
 @dataclass
-class PeerScore:
-    node_id: str
-    success_rate: float = 1.0
-    last_seen: float = 0.0
-    total_interactions: int = 0
-    response_time_ms: float = 0.0
+class Proposal:
+    id: str
+    description: str
+    action: Callable
+    timestamp: float
+    votes: Dict[str, VoteType]
+    executed: bool
+    min_votes: int
+    expiration: float
 
 class SwarmNode:
-    def __init__(self, node_id: str):
+    def __init__(self, node_id: str, peers: List[str] = None):
         self.node_id = node_id
-        self.peers: Dict[str, PeerScore] = {}
-        self.min_reputation = 0.3
-        self.decay_factor = 0.95
-        self.last_cleanup = time.time()
-    
-    def update_peer_score(self, peer_id: str, success: bool, response_time_ms: Optional[float] = None) -> None:
-        if peer_id not in self.peers:
-            self.peers[peer_id] = PeerScore(node_id=peer_id)
-        
-        peer = self.peers[peer_id]
-        peer.total_interactions += 1
-        peer.last_seen = time.time()
-        
-        if success:
-            # Weighted average for success rate
-            peer.success_rate = (peer.success_rate * peer.total_interactions + 1.0) / (peer.total_interactions + 1)
-        else:
-            peer.success_rate = (peer.success_rate * peer.total_interactions) / (peer.total_interactions + 1)
-            
-        if response_time_ms:
-            # Exponential moving average for response time
-            alpha = 0.1
-            peer.response_time_ms = (alpha * response_time_ms + 
-                                   (1 - alpha) * peer.response_time_ms)
-    
-    def get_peer_reputation(self, peer_id: str) -> float:
-        if peer_id not in self.peers:
-            return 0.0
-            
-        peer = self.peers[peer_id]
-        time_penalty = max(0, 1 - (time.time() - peer.last_seen) / (24 * 3600))
-        
-        # Combine multiple factors into reputation score
-        reputation = (
-            0.4 * peer.success_rate +
-            0.3 * time_penalty +
-            0.3 * min(1.0, 1000 / max(1, peer.response_time_ms))
+        self.peers = peers or []
+        self.proposals: Dict[str, Proposal] = {}
+        self.state = {}
+        self.min_consensus_ratio = 0.67
+
+    async def submit_proposal(self, description: str, action: Callable, expiration_seconds: int = 300) -> str:
+        proposal_id = f'prop_{int(time.time())}_{self.node_id}'
+        self.proposals[proposal_id] = Proposal(
+            id=proposal_id,
+            description=description,
+            action=action,
+            timestamp=time.time(),
+            votes={self.node_id: VoteType.YES},
+            executed=False,
+            min_votes=max(len(self.peers) // 2 + 1, 2),
+            expiration=time.time() + expiration_seconds
         )
-        return reputation
-    
-    def get_best_peers(self, n: int = 5) -> List[str]:
-        # Clean up stale peers
-        self._cleanup_peers()
-        
-        # Sort peers by reputation
-        sorted_peers = sorted(
-            self.peers.items(),
-            key=lambda x: self.get_peer_reputation(x[0]),
-            reverse=True
-        )
-        
-        return [p[0] for p in sorted_peers[:n]]
-    
-    def _cleanup_peers(self) -> None:
+        await self.broadcast_proposal(proposal_id)
+        return proposal_id
+
+    async def vote(self, proposal_id: str, vote: VoteType) -> bool:
+        if proposal_id not in self.proposals:
+            return False
+            
+        proposal = self.proposals[proposal_id]
+        if time.time() > proposal.expiration:
+            return False
+
+        proposal.votes[self.node_id] = vote
+        await self.check_and_execute_proposal(proposal_id)
+        return True
+
+    async def check_and_execute_proposal(self, proposal_id: str) -> bool:
+        proposal = self.proposals[proposal_id]
+        if proposal.executed:
+            return False
+
+        yes_votes = sum(1 for v in proposal.votes.values() if v == VoteType.YES)
+        total_votes = len(proposal.votes)
+
+        if yes_votes >= proposal.min_votes and \\
+           yes_votes / total_votes >= self.min_consensus_ratio:
+            try:
+                proposal.action()
+                proposal.executed = True
+                return True
+            except Exception as e:
+                print(f'Error executing proposal {proposal_id}: {str(e)}')
+        return False
+
+    async def broadcast_proposal(self, proposal_id: str):
+        # In a real implementation, this would use network communication
+        # to broadcast the proposal to all peers
+        pass
+
+    async def sync_state(self):
+        # Implement state synchronization between nodes
+        pass
+
+    def get_proposal_status(self, proposal_id: str) -> Dict:
+        if proposal_id not in self.proposals:
+            return {}
+
+        prop = self.proposals[proposal_id]
+        return {
+            'id': prop.id,
+            'description': prop.description,
+            'votes_yes': sum(1 for v in prop.votes.values() if v == VoteType.YES),
+            'votes_no': sum(1 for v in prop.votes.values() if v == VoteType.NO),
+            'votes_abstain': sum(1 for v in prop.votes.values() if v == VoteType.ABSTAIN),
+            'executed': prop.executed,
+            'expired': time.time() > prop.expiration
+        }
+
+    async def cleanup_expired_proposals(self):
         current_time = time.time()
-        if current_time - self.last_cleanup < 3600:  # Run cleanup once per hour
-            return
-            
-        self.last_cleanup = current_time
-        stale_peers = [
-            peer_id for peer_id, score in self.peers.items()
-            if self.get_peer_reputation(peer_id) < self.min_reputation
-        ]
-        
-        for peer_id in stale_peers:
-            del self.peers[peer_id]
-    
-    def get_node_fingerprint(self) -> str:
-        """Generate a unique fingerprint for this node based on behavior"""
-        data = f"{self.node_id}:{len(self.peers)}:{sum(p.success_rate for p in self.peers.values())}"
-        return hashlib.sha256(data.encode()).hexdigest()[:16]
+        expired = [pid for pid, p in self.proposals.items() 
+                  if current_time > p.expiration and not p.executed]
+        for pid in expired:
+            del self.proposals[pid]
