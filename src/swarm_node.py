@@ -1,105 +1,87 @@
-import asyncio
-from dataclasses import dataclass
-from typing import List, Dict, Callable
-from enum import Enum
 import time
-
-class VoteType(Enum):
-    YES = 1
-    NO = 0
-    ABSTAIN = -1
+import hashlib
+from typing import List, Dict, Any
+from dataclasses import dataclass
 
 @dataclass
-class Proposal:
-    id: str
-    description: str
-    action: Callable
+class Message:
+    sender: str
+    proposal: Any
+    signature: str
     timestamp: float
-    votes: Dict[str, VoteType]
-    executed: bool
-    min_votes: int
-    expiration: float
 
 class SwarmNode:
-    def __init__(self, node_id: str, peers: List[str] = None):
+    def __init__(self, node_id: str, peers: List[str]):
         self.node_id = node_id
-        self.peers = peers or []
-        self.proposals: Dict[str, Proposal] = {}
-        self.state = {}
-        self.min_consensus_ratio = 0.67
-
-    async def submit_proposal(self, description: str, action: Callable, expiration_seconds: int = 300) -> str:
-        proposal_id = f'prop_{int(time.time())}_{self.node_id}'
-        self.proposals[proposal_id] = Proposal(
-            id=proposal_id,
-            description=description,
-            action=action,
-            timestamp=time.time(),
-            votes={self.node_id: VoteType.YES},
-            executed=False,
-            min_votes=max(len(self.peers) // 2 + 1, 2),
-            expiration=time.time() + expiration_seconds
+        self.peers = peers
+        self.proposals: Dict[str, Any] = {}
+        self.votes: Dict[str, Dict[str, bool]] = {}
+        self.committed: Dict[str, Any] = {}
+        self.round = 0
+        
+    def create_proposal(self, proposal: Any) -> Message:
+        """Create a signed proposal message"""
+        timestamp = time.time()
+        msg_hash = hashlib.sha256(f"{self.node_id}{proposal}{timestamp}".encode()).hexdigest()
+        return Message(
+            sender=self.node_id,
+            proposal=proposal,
+            signature=msg_hash,
+            timestamp=timestamp
         )
-        await self.broadcast_proposal(proposal_id)
-        return proposal_id
-
-    async def vote(self, proposal_id: str, vote: VoteType) -> bool:
-        if proposal_id not in self.proposals:
+    
+    def receive_proposal(self, message: Message) -> bool:
+        """Process received proposal and vote"""
+        if not self._verify_message(message):
             return False
             
-        proposal = self.proposals[proposal_id]
-        if time.time() > proposal.expiration:
+        proposal_id = message.signature
+        if proposal_id not in self.proposals:
+            self.proposals[proposal_id] = message.proposal
+            self.votes[proposal_id] = {}
+        
+        # Vote on proposal
+        vote = self._validate_proposal(message.proposal)
+        self.votes[proposal_id][self.node_id] = vote
+        return vote
+
+    def check_consensus(self, proposal_id: str) -> bool:
+        """Check if consensus is reached for a proposal"""
+        if proposal_id not in self.votes:
             return False
-
-        proposal.votes[self.node_id] = vote
-        await self.check_and_execute_proposal(proposal_id)
-        return True
-
-    async def check_and_execute_proposal(self, proposal_id: str) -> bool:
-        proposal = self.proposals[proposal_id]
-        if proposal.executed:
-            return False
-
-        yes_votes = sum(1 for v in proposal.votes.values() if v == VoteType.YES)
-        total_votes = len(proposal.votes)
-
-        if yes_votes >= proposal.min_votes and \\
-           yes_votes / total_votes >= self.min_consensus_ratio:
-            try:
-                proposal.action()
-                proposal.executed = True
+            
+        total_votes = len(self.votes[proposal_id])
+        positive_votes = sum(1 for v in self.votes[proposal_id].values() if v)
+        
+        # Require 2/3 majority for Byzantine fault tolerance
+        if total_votes >= len(self.peers) * 2/3:
+            if positive_votes >= total_votes * 2/3:
+                self._commit_proposal(proposal_id)
                 return True
-            except Exception as e:
-                print(f'Error executing proposal {proposal_id}: {str(e)}')
         return False
 
-    async def broadcast_proposal(self, proposal_id: str):
-        # In a real implementation, this would use network communication
-        # to broadcast the proposal to all peers
-        pass
+    def _verify_message(self, message: Message) -> bool:
+        """Verify message authenticity"""
+        expected_hash = hashlib.sha256(
+            f"{message.sender}{message.proposal}{message.timestamp}".encode()
+        ).hexdigest()
+        return message.signature == expected_hash
 
-    async def sync_state(self):
-        # Implement state synchronization between nodes
-        pass
+    def _validate_proposal(self, proposal: Any) -> bool:
+        """Custom validation logic for proposals"""
+        # Implement domain-specific validation
+        return True
 
-    def get_proposal_status(self, proposal_id: str) -> Dict:
-        if proposal_id not in self.proposals:
-            return {}
+    def _commit_proposal(self, proposal_id: str) -> None:
+        """Commit an accepted proposal"""
+        if proposal_id in self.proposals and proposal_id not in self.committed:
+            self.committed[proposal_id] = self.proposals[proposal_id]
+            self.round += 1
 
-        prop = self.proposals[proposal_id]
-        return {
-            'id': prop.id,
-            'description': prop.description,
-            'votes_yes': sum(1 for v in prop.votes.values() if v == VoteType.YES),
-            'votes_no': sum(1 for v in prop.votes.values() if v == VoteType.NO),
-            'votes_abstain': sum(1 for v in prop.votes.values() if v == VoteType.ABSTAIN),
-            'executed': prop.executed,
-            'expired': time.time() > prop.expiration
-        }
+    def get_committed_proposals(self) -> Dict[str, Any]:
+        """Return all committed proposals"""
+        return self.committed.copy()
 
-    async def cleanup_expired_proposals(self):
-        current_time = time.time()
-        expired = [pid for pid, p in self.proposals.items() 
-                  if current_time > p.expiration and not p.executed]
-        for pid in expired:
-            del self.proposals[pid]
+    def get_current_round(self) -> int:
+        """Return current consensus round"""
+        return self.round
